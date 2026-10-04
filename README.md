@@ -12,7 +12,7 @@ python -m uvicorn app.main:app --reload
 
 `.env` 只留在本机和服务器上，不要提交。仓库里只有空的 `.env.example`。
 
-服务器上把代码拉到 `/home/ubuntu/jev`，复制 `.env.example` 为 `.env` 并填入密钥，再建虚拟环境安装依赖。应用只听本机 8000。同机的 runtime 已占用公网 8080，所以本项目对外用 `deploy/Caddyfile` 的 8081。进程用 `deploy/jev.service` 交给 systemd，退出登录后仍会运行。腾讯云防火墙和系统防火墙都要放行 TCP 8081。没有域名时，简历地址是 `http://公网IP:8081`。
+服务器上把代码拉到 `/home/ubuntu/jev`，复制 `.env.example` 为 `.env` 并填入密钥，再建虚拟环境安装依赖。应用只听本机 8001。同机的 runtime 已占用本机 8000 和公网 8080，所以本项目对外用 `deploy/Caddyfile` 的 8081。进程用 `deploy/jev.service` 交给 systemd，退出登录后仍会运行。腾讯云防火墙和系统防火墙都要放行 TCP 8081。没有域名时，简历地址是 `http://公网IP:8081`。
 
 ## API
 
