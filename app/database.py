@@ -4,7 +4,7 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 from .config import settings
 from .models import AnswerRun, Chunk, Comparison, Document, Question, Selection, Workspace
@@ -23,6 +23,18 @@ CREATE INDEX IF NOT EXISTS idx_questions_workspace ON questions(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_selections_question ON selections(question_id);
 CREATE INDEX IF NOT EXISTS idx_answers_selection ON answers(selection_id);
 CREATE INDEX IF NOT EXISTS idx_comparisons_question ON comparisons(question_id);
+CREATE TABLE IF NOT EXISTS review_batches (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, contract_type TEXT NOT NULL, status TEXT NOT NULL, token_count INTEGER NOT NULL DEFAULT 0, token_limit INTEGER NOT NULL, reason TEXT, active_chunk_set_id TEXT);
+CREATE TABLE IF NOT EXISTS review_files (id TEXT PRIMARY KEY, batch_id TEXT NOT NULL REFERENCES review_batches(id), filename TEXT NOT NULL, content BLOB NOT NULL, page_count INTEGER NOT NULL, status TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS review_pages (id TEXT PRIMARY KEY, file_id TEXT NOT NULL REFERENCES review_files(id), batch_id TEXT NOT NULL, page_number INTEGER NOT NULL, status TEXT NOT NULL, content TEXT NOT NULL DEFAULT '[]', error TEXT, attempts INTEGER NOT NULL DEFAULT 0, UNIQUE(file_id, page_number));
+CREATE TABLE IF NOT EXISTS review_chunks (id TEXT PRIMARY KEY, batch_id TEXT NOT NULL, chunk_set_id TEXT NOT NULL, file_id TEXT NOT NULL, page_id TEXT NOT NULL, ordinal INTEGER NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL, token_count INTEGER NOT NULL, source TEXT NOT NULL, image BLOB, version TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS review_risks (id TEXT PRIMARY KEY, batch_id TEXT NOT NULL REFERENCES review_batches(id), name TEXT NOT NULL, original_query TEXT NOT NULL, retrieval_query TEXT NOT NULL, status TEXT NOT NULL, position INTEGER NOT NULL, custom INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS review_retrievals (id TEXT PRIMARY KEY, risk_id TEXT NOT NULL REFERENCES review_risks(id), round_number INTEGER NOT NULL, query TEXT NOT NULL, method TEXT NOT NULL, status TEXT NOT NULL, candidates TEXT NOT NULL DEFAULT '[]', selected TEXT NOT NULL DEFAULT '[]', error TEXT, calls INTEGER NOT NULL DEFAULT 0, elapsed_ms INTEGER, UNIQUE(risk_id, round_number));
+CREATE TABLE IF NOT EXISTS review_decisions (id TEXT PRIMARY KEY, risk_id TEXT NOT NULL REFERENCES review_risks(id), round_number INTEGER NOT NULL, action TEXT NOT NULL, next_query TEXT NOT NULL DEFAULT '', conclusion TEXT, reason TEXT NOT NULL DEFAULT '', pages TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL, UNIQUE(risk_id, round_number));
+CREATE TABLE IF NOT EXISTS review_answers (id TEXT PRIMARY KEY, risk_id TEXT NOT NULL REFERENCES review_risks(id), status TEXT NOT NULL, text TEXT NOT NULL DEFAULT '', model_name TEXT NOT NULL, prompt_version TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, usage TEXT NOT NULL DEFAULT '{}', cost_status TEXT NOT NULL DEFAULT 'not_calculated', elapsed_ms INTEGER, error TEXT, images_sent INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS review_proofs (id TEXT PRIMARY KEY, batch_id TEXT NOT NULL, risk_id TEXT NOT NULL, created_at TEXT NOT NULL, status TEXT NOT NULL, label_conclusion TEXT, label_pages TEXT NOT NULL DEFAULT '[]', verdict INTEGER, evidence_f1 REAL, evidence_status TEXT NOT NULL, rounds INTEGER NOT NULL DEFAULT 0, calls TEXT NOT NULL DEFAULT '{}', tokens TEXT NOT NULL DEFAULT '{}', cost_status TEXT NOT NULL DEFAULT 'not_calculated', review_ms INTEGER, answer_ms INTEGER, valid INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS review_experience (id TEXT PRIMARY KEY, risk_name TEXT NOT NULL, query TEXT NOT NULL, method TEXT NOT NULL, outcome TEXT NOT NULL, proof_id TEXT NOT NULL UNIQUE, batch_id TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_review_pages_batch ON review_pages(batch_id, status);
+CREATE INDEX IF NOT EXISTS idx_review_risks_batch ON review_risks(batch_id, position);
 """
 
 class Database:
@@ -203,6 +215,159 @@ class Database:
         with self._session() as conn:
             ids = [r["id"] for r in conn.execute("SELECT id FROM comparisons WHERE question_id = ? ORDER BY rowid", (question_id,))]
         return [self.get_comparison(i) for i in ids]
+
+    def create_review_batch(self, batch_id: str, created_at: str, contract_type: str, token_limit: int,
+                            files: list[tuple[str, str, bytes, int, list[tuple[str, int]]]]) -> None:
+        with self._session() as conn:
+            conn.execute("INSERT INTO review_batches (id, created_at, contract_type, status, token_count, token_limit) VALUES (?, ?, ?, 'waiting', 0, ?)",
+                         (batch_id, created_at, contract_type, token_limit))
+            for file_id, filename, content, page_count, pages in files:
+                conn.execute("INSERT INTO review_files (id, batch_id, filename, content, page_count, status) VALUES (?, ?, ?, ?, ?, 'waiting')",
+                             (file_id, batch_id, filename, content, page_count))
+                conn.executemany("INSERT INTO review_pages (id, file_id, batch_id, page_number, status) VALUES (?, ?, ?, ?, 'waiting')",
+                                 [(page_id, file_id, batch_id, number) for page_id, number in pages])
+
+    def review_batch(self, batch_id: str) -> sqlite3.Row | None:
+        with self._session() as conn:
+            return conn.execute("SELECT * FROM review_batches WHERE id = ?", (batch_id,)).fetchone()
+
+    def review_progress(self, batch_id: str) -> dict[str, Any]:
+        with self._session() as conn:
+            batch = conn.execute("SELECT * FROM review_batches WHERE id = ?", (batch_id,)).fetchone()
+            if not batch:
+                return {}
+            pages = conn.execute("SELECT status, COUNT(*) AS n FROM review_pages WHERE batch_id = ? GROUP BY status", (batch_id,)).fetchall()
+            counts = {row["status"]: row["n"] for row in pages}
+            risks = [dict(row) for row in conn.execute("SELECT id, name, original_query, status, position FROM review_risks WHERE batch_id = ? ORDER BY position", (batch_id,))]
+            failed = [dict(row) for row in conn.execute("SELECT id, file_id, page_number, error FROM review_pages WHERE batch_id = ? AND status = 'failed' ORDER BY page_number", (batch_id,))]
+            return {"id": batch["id"], "status": batch["status"], "contract_type": batch["contract_type"],
+                    "created_at": batch["created_at"], "token_count": batch["token_count"], "token_limit": batch["token_limit"],
+                    "reason": batch["reason"], "pages": counts, "failed_pages": failed, "risks": risks}
+
+    def claim_review_page(self) -> sqlite3.Row | None:
+        with self._session() as conn:
+            conn.execute("UPDATE review_pages SET status = 'waiting' WHERE status = 'processing'")
+            row = conn.execute("SELECT review_pages.id, review_pages.file_id, review_pages.batch_id, review_pages.page_number, review_files.content, review_files.filename FROM review_pages JOIN review_files ON review_files.id = review_pages.file_id JOIN review_batches ON review_batches.id = review_pages.batch_id WHERE review_pages.status = 'waiting' AND review_batches.status != 'rejected' ORDER BY review_pages.rowid LIMIT 1").fetchone()
+            if not row:
+                return None
+            conn.execute("UPDATE review_pages SET status = 'processing', attempts = attempts + 1 WHERE id = ?", (row["id"],))
+            conn.execute("UPDATE review_batches SET status = 'processing' WHERE id = ? AND status = 'waiting'", (row["batch_id"],))
+            return row
+
+    def finish_review_page(self, page_id: str, blocks: list[dict[str, Any]]) -> None:
+        stored = []
+        for block in blocks:
+            item = {key: value for key, value in block.items() if key != "image"}
+            item["has_image"] = bool(block.get("image"))
+            stored.append(item)
+        with self._session() as conn:
+            conn.execute("UPDATE review_pages SET status = 'complete', content = ?, error = NULL WHERE id = ?",
+                         (json.dumps(stored, ensure_ascii=False), page_id))
+
+    def fail_review_page(self, page_id: str, error: str) -> None:
+        with self._session() as conn:
+            conn.execute("UPDATE review_pages SET status = 'failed', error = ? WHERE id = ?", (error, page_id))
+
+    def review_page_content(self, page_id: str) -> list[dict[str, Any]]:
+        with self._session() as conn:
+            row = conn.execute("SELECT content FROM review_pages WHERE id = ?", (page_id,)).fetchone()
+        return json.loads(row["content"]) if row else []
+
+    def claim_chunk_page(self, chunk_set_id: str) -> sqlite3.Row | None:
+        with self._session() as conn:
+            row = conn.execute("""SELECT review_pages.* FROM review_pages
+                JOIN review_batches ON review_batches.id = review_pages.batch_id
+                WHERE review_pages.status = 'complete' AND review_batches.status != 'rejected'
+                AND NOT EXISTS (SELECT 1 FROM review_pages failed WHERE failed.batch_id = review_pages.batch_id AND failed.status = 'failed')
+                AND NOT EXISTS (SELECT 1 FROM review_pages waiting WHERE waiting.batch_id = review_pages.batch_id AND waiting.status IN ('waiting', 'processing'))
+                AND NOT EXISTS (SELECT 1 FROM review_chunks WHERE review_chunks.page_id = review_pages.id AND review_chunks.chunk_set_id = ?)
+                ORDER BY review_pages.rowid LIMIT 1""", (chunk_set_id,)).fetchone()
+            return row
+
+    def replace_page_chunks(self, page_id: str, chunk_set_id: str, rows: list[tuple]) -> None:
+        with self._session() as conn:
+            existing = conn.execute("SELECT COUNT(*) AS n FROM review_chunks WHERE page_id = ? AND chunk_set_id = ?", (page_id, chunk_set_id)).fetchone()["n"]
+            if existing:
+                return
+            conn.executemany("INSERT INTO review_chunks (id, batch_id, chunk_set_id, file_id, page_id, ordinal, kind, text, token_count, source, image, version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+
+    def refresh_batch_tokens(self, batch_id: str, chunk_set_id: str, token_limit: int) -> str:
+        with self._session() as conn:
+            total = conn.execute("SELECT COALESCE(SUM(token_count), 0) AS n FROM review_chunks WHERE batch_id = ? AND chunk_set_id = ?", (batch_id, chunk_set_id)).fetchone()["n"]
+            pending = conn.execute("SELECT COUNT(*) AS n FROM review_pages WHERE batch_id = ? AND status != 'complete'", (batch_id,)).fetchone()["n"]
+            status = "rejected" if total > token_limit else ("ready" if pending == 0 else "processing")
+            reason = "正文超过 80 万 token" if total > token_limit else None
+            conn.execute("UPDATE review_batches SET token_count = ?, status = ?, reason = ?, active_chunk_set_id = ? WHERE id = ?",
+                         (total, status, reason, chunk_set_id, batch_id))
+            return status
+
+    def batch_needs_risks(self, batch_id: str) -> bool:
+        with self._session() as conn:
+            batch = conn.execute("SELECT status FROM review_batches WHERE id = ?", (batch_id,)).fetchone()
+            count = conn.execute("SELECT COUNT(*) AS n FROM review_risks WHERE batch_id = ?", (batch_id,)).fetchone()["n"]
+            return bool(batch and batch["status"] == "ready" and count == 0)
+
+    def save_risks(self, rows: list[tuple]) -> None:
+        with self._session() as conn:
+            conn.executemany("INSERT OR IGNORE INTO review_risks (id, batch_id, name, original_query, retrieval_query, status, position, custom) VALUES (?, ?, ?, ?, ?, 'waiting', ?, ?)", rows)
+
+    def claim_risk(self) -> sqlite3.Row | None:
+        with self._session() as conn:
+            row = conn.execute("SELECT review_risks.*, review_batches.active_chunk_set_id, review_batches.contract_type FROM review_risks JOIN review_batches ON review_batches.id = review_risks.batch_id WHERE review_risks.status = 'waiting' AND review_batches.status = 'ready' ORDER BY review_risks.position LIMIT 1").fetchone()
+            if row:
+                conn.execute("UPDATE review_risks SET status = 'processing' WHERE id = ?", (row["id"],))
+            return row
+
+    def batch_chunks(self, batch_id: str, chunk_set_id: str) -> list[sqlite3.Row]:
+        with self._session() as conn:
+            return list(conn.execute("SELECT * FROM review_chunks WHERE batch_id = ? AND chunk_set_id = ? ORDER BY ordinal, rowid", (batch_id, chunk_set_id)))
+
+    def save_retrieval(self, row: tuple) -> None:
+        with self._session() as conn:
+            conn.execute("INSERT OR REPLACE INTO review_retrievals (id, risk_id, round_number, query, method, status, candidates, selected, error, calls, elapsed_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", row)
+
+    def latest_retrieval(self, risk_id: str) -> sqlite3.Row | None:
+        with self._session() as conn:
+            return conn.execute("SELECT * FROM review_retrievals WHERE risk_id = ? ORDER BY round_number DESC LIMIT 1", (risk_id,)).fetchone()
+
+    def prior_queries(self, risk_id: str) -> list[str]:
+        with self._session() as conn:
+            return [row["query"] for row in conn.execute("SELECT query FROM review_retrievals WHERE risk_id = ? ORDER BY round_number", (risk_id,))]
+
+    def save_decision(self, row: tuple) -> None:
+        with self._session() as conn:
+            conn.execute("INSERT OR REPLACE INTO review_decisions (id, risk_id, round_number, action, next_query, conclusion, reason, pages, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", row)
+
+    def latest_decision(self, risk_id: str) -> sqlite3.Row | None:
+        with self._session() as conn:
+            return conn.execute("SELECT * FROM review_decisions WHERE risk_id = ? ORDER BY round_number DESC LIMIT 1", (risk_id,)).fetchone()
+
+    def finish_risk(self, risk_id: str, status: str, next_query: str | None = None) -> None:
+        with self._session() as conn:
+            if next_query is None:
+                conn.execute("UPDATE review_risks SET status = ? WHERE id = ?", (status, risk_id))
+            else:
+                conn.execute("UPDATE review_risks SET status = ?, retrieval_query = ? WHERE id = ?", (status, next_query, risk_id))
+
+    def save_review_answer(self, row: tuple) -> None:
+        with self._session() as conn:
+            conn.execute("INSERT INTO review_answers (id, risk_id, status, text, model_name, prompt_version, input_tokens, output_tokens, usage, cost_status, elapsed_ms, error, images_sent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", row)
+
+    def review_results(self, batch_id: str) -> list[dict[str, Any]]:
+        with self._session() as conn:
+            risks = conn.execute("SELECT * FROM review_risks WHERE batch_id = ? ORDER BY position", (batch_id,)).fetchall()
+            results = []
+            for risk in risks:
+                decision = conn.execute("SELECT * FROM review_decisions WHERE risk_id = ? AND action = 'stop' ORDER BY round_number DESC LIMIT 1", (risk["id"],)).fetchone()
+                answer = conn.execute("SELECT * FROM review_answers WHERE risk_id = ? ORDER BY rowid DESC LIMIT 1", (risk["id"],)).fetchone()
+                results.append({"id": risk["id"], "name": risk["name"], "status": risk["status"],
+                                "conclusion": decision["conclusion"] if decision else None,
+                                "pages": json.loads(decision["pages"]) if decision else [],
+                                "reason": decision["reason"] if decision else "",
+                                "answer": answer["text"] if answer else "",
+                                "answer_status": answer["status"] if answer else None,
+                                "answer_error": answer["error"] if answer else None})
+            return results
 
 def _chunk_row(chunk: Chunk) -> tuple:
     return (chunk.id, chunk.chunk_set_id, chunk.document_id, chunk.ordinal, chunk.text, chunk.token_count,

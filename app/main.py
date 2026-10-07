@@ -4,13 +4,14 @@ from html import escape
 from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from .config import settings
 from .comparison import build_comparison, comparison_payload, score_run
 from .database import db
 from .models import AnswerRun, Question, Selection
+from .review import accept_uploads
 from .services import (add_document, answer_with_deepseek, create_question, create_workspace,
                        remove_document, rechunk_workspace, select_full, select_rag, select_with_fallback,
                        select_with_jev)
@@ -172,6 +173,18 @@ def _page(title: str, body: str) -> str:
 
 @app.get("/", response_class=HTMLResponse)
 def home() -> str:
+    return _page("合同审查", """
+    <header><div><p class="muted">上传后按清单逐项核对</p><h1>合同审查</h1>
+    <p class="muted">每项只给出找到、冲突或缺失，并回到页码。识别和检索在后台进行。</p></div></header>
+    <section class="card"><form action="/reviews" method="post" enctype="multipart/form-data">
+    <label>合同 PDF<input type="file" name="files" accept="application/pdf,.pdf" multiple required></label>
+    <label>合同类型<select name="contract_type"><option value="commercial">商业合同</option><option value="rental">房屋租赁</option><option value="labor">劳动合同</option></select></label>
+    <button type="submit">开始审查</button></form></section>
+    <p class="muted"><a href="/ask-page">原来的提问页</a></p>""")
+
+
+@app.get("/ask-page", response_class=HTMLResponse)
+def ask_page() -> str:
     return _page("Jev Context Selector", """
     <header><div><p class="muted">同一批 PDF，两种读取方式</p><h1>Jev Context Selector</h1>
     <p class="muted">上传文档后直接提问。Jev 只把用到的内容送进模型；整篇对照会送入全部内容。</p></div></header>
@@ -180,6 +193,45 @@ def home() -> str:
     <label>读取方式<select name="mode"><option value="jev">Jev 直选</option><option value="full">整篇对照</option></select></label>
     <label>问题<textarea name="question" placeholder="输入一个可以独立理解的问题" required></textarea></label>
     <button type="submit">开始提问</button></form></section>""")
+
+
+@app.post("/reviews", response_model=None)
+async def create_review(files: Annotated[list[UploadFile], File()],
+                        contract_type: Annotated[str, Form()] = "commercial") -> HTMLResponse | RedirectResponse:
+    try:
+        progress = accept_uploads([_read_upload(item) for item in files], contract_type, db, settings)
+    except ValueError as exc:
+        return HTMLResponse(_page("无法建立审查", f"<h1>无法建立审查</h1><p>{escape(str(exc))}</p><p><a href='/'>返回</a></p>"))
+    return RedirectResponse(f"/reviews/{progress['id']}", status_code=303)
+
+
+@app.get("/reviews/{batch_id}", response_class=HTMLResponse)
+def review_page(batch_id: str) -> str:
+    progress = db.review_progress(batch_id)
+    if not progress:
+        raise HTTPException(404, "审查不存在")
+    progress["results"] = db.review_results(batch_id)
+    return _page("审查进度", _review_html(progress))
+
+
+def _review_html(progress: dict[str, Any]) -> str:
+    counts = progress.get("pages") or {}
+    total = sum(counts.values())
+    done = counts.get("complete", 0)
+    failed = counts.get("failed", 0)
+    risks = progress.get("results") or progress.get("risks") or []
+    items = []
+    for risk in risks:
+        conclusion = risk.get("conclusion") or risk.get("status") or ""
+        pages = "、".join(str(page) for page in risk.get("pages") or [])
+        answer = risk.get("answer") or ""
+        items.append(f"<article><h2>{escape(risk['name'])}</h2><p>{escape(str(conclusion))}</p>"
+                     f"<p class='muted'>页码：{escape(pages or '还没有')}</p><pre>{escape(answer)}</pre></article>")
+    finished = progress["status"] in {"ready", "rejected"} and risks and all(item.get("status") in {"complete", "failed"} for item in risks)
+    refresh = "" if finished else "<meta http-equiv='refresh' content='3'>"
+    return (f"{refresh}<header><div><h1>审查进度</h1><p class='muted'>页面 {done}/{total}，失败 {failed}</p></div></header>"
+            f"<section><p>状态：{escape(progress['status'])}</p><p class='muted'>{escape(progress.get('reason') or '')}</p></section>"
+            + "".join(items) + "<p><a href='/'>返回</a></p>")
 
 
 @app.post("/workspaces")

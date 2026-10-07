@@ -1,0 +1,16 @@
+[Unit]
+Description=Jev contract review worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/jev
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/jev/.venv/bin/python -m app.worker
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

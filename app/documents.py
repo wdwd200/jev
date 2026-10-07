@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import re
 
+from typing import Any
+
 from .models import Block, Document, new_id
 from .tokens import count_tokens
 
@@ -83,6 +85,37 @@ def _parse_docling(content: bytes) -> list[Block] | None:
     if markdown.strip():
         blocks.insert(0, Block("text", markdown.strip(), 1, 1))
     return blocks or None
+
+
+def recognize_page(content: bytes, page_number: int) -> list[dict[str, Any]]:
+    """Recognize one PDF page. A page with no text layer still returns its images."""
+    import pymupdf
+
+    document = pymupdf.open(stream=content, filetype="pdf")
+    try:
+        if page_number < 1 or page_number > document.page_count:
+            raise ValueError("Page is outside the PDF")
+        repeated = _repeated_margins([_page_lines(page) for page in document])
+        page = document[page_number - 1]
+        lines = [line for line in _page_lines(page) if line.strip() not in repeated]
+        blocks: list[dict[str, Any]] = []
+        text = _unwrap(lines)
+        if text:
+            blocks.append({"kind": "text", "text": text, "position": 1, "headings": []})
+        finder = page.find_tables()
+        for index, table in enumerate(finder.tables, start=1):
+            rendered = _markdown_table(table.extract())
+            if rendered:
+                blocks.append({"kind": "table", "text": rendered, "position": index, "headings": []})
+        for index, image in enumerate(page.get_images(full=True), start=1):
+            payload = document.extract_image(image[0])
+            raw = payload.get("image", b"")
+            blocks.append({"kind": "image", "text": "", "position": index, "headings": [], "image": raw})
+        if not blocks:
+            blocks.append({"kind": "image", "text": "", "position": 1, "headings": [], "image": b""})
+        return blocks
+    finally:
+        document.close()
 
 
 def _page_of(item: Any) -> int:
